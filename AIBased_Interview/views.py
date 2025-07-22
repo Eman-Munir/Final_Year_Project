@@ -25,6 +25,35 @@ from django.views.decorators.http import require_POST
 from django.core.mail import send_mail
 from django.conf import settings
 from django.middleware.csrf import get_token
+import threading
+
+# Global model and lock for thread safety
+_confidence_model = None
+_confidence_model_lock = threading.Lock()
+
+# Preprocessing pipeline (module-level)
+confidence_preprocess = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+def get_confidence_model():
+    global _confidence_model
+    with _confidence_model_lock:
+        if _confidence_model is None:
+            device = torch.device('cpu')
+            model = models.resnet18(weights=None)
+            model.fc = nn.Linear(model.fc.in_features, 2)
+            model_path = os.path.join(os.path.dirname(__file__), '..', 'confidence_model.pth')
+            if not os.path.exists(model_path):
+                model_path = 'confidence_model.pth'
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(f"Model file not found at {model_path}")
+            model.load_state_dict(torch.load(model_path, map_location=device))
+            model.eval()
+            _confidence_model = model
+        return _confidence_model
 
 def index(request):
     return render(request, 'index.html')
@@ -406,115 +435,49 @@ def generate_chat_response(user_message: str) -> str:
     except Exception as e:
         return "I'm sorry, I'm having trouble connecting right now. Please try again in a moment or contact our support team for immediate assistance."
 
-@login_required(login_url='/') 
+@login_required(login_url='/')
+@require_POST
 def confidence_checker(request):
-    if request.method == 'POST':
+    try:
+        print(f"Confidence checker called by user: {request.user.username}")
+        if 'confidence_image' not in request.FILES:
+            return JsonResponse({'error': 'No image uploaded'}, status=400)
+        image_file = request.FILES['confidence_image']
+        print(f"Image file received: {image_file.name}, size: {image_file.size}")
+        allowed_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif']
+        if not any(image_file.name.lower().endswith(ext) for ext in allowed_extensions):
+            return JsonResponse({'error': 'Only image files are allowed (.jpg, .jpeg, .png, .bmp, .gif)'}, status=400)
+        # Process image in memory
         try:
-            print(f"Confidence checker called by user: {request.user.username}")
-            
-            if 'confidence_image' not in request.FILES:
-                return JsonResponse({'error': 'No image uploaded'}, status=400)
-            
-            image_file = request.FILES['confidence_image']
-            print(f"Image file received: {image_file.name}, size: {image_file.size}")
-            
-            # Check if file is an image
-            allowed_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif']
-            if not any(image_file.name.lower().endswith(ext) for ext in allowed_extensions):
-                return JsonResponse({'error': 'Only image files are allowed (.jpg, .jpeg, .png, .bmp, .gif)'}, status=400)
-            
-            # Save file temporarily
-            file_name = default_storage.save(f'temp_confidence_{request.user.id}.jpg', ContentFile(image_file.read()))
-            file_path = default_storage.path(file_name)
-            print(f"Image saved temporarily at: {file_path}")
-            
-            try:
-                # Load model and predict
-                print("Loading confidence model...")
-                model = initialize_confidence_model()
-                print("Model loaded, making prediction...")
-                confidence_result = predict_confidence(file_path, model)
-                print(f"Prediction result: {confidence_result}")
-                
-                # Clean up temporary file
-                default_storage.delete(file_name)
-                print("Temporary file cleaned up")
-                
-                return JsonResponse({
-                    'result': confidence_result,
-                    'message': f'Analysis complete! You appear to be {confidence_result}.',
-                    'advice': get_confidence_advice(confidence_result)
-                })
-                
-            except Exception as e:
-                # Clean up temporary file in case of error
-                if default_storage.exists(file_name):
-                    default_storage.delete(file_name)
-                print(f"Error during model processing: {str(e)}")
-                raise e
-                
+            img = Image.open(image_file)
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            img_tensor = confidence_preprocess(img).unsqueeze(0)
         except Exception as e:
-            print(f"Error in confidence_checker: {str(e)}")
-            return JsonResponse({'error': f'Processing error: {str(e)}'}, status=500)
-    
-    return JsonResponse({'error': 'Invalid request method'}, status=405)
-
-def initialize_confidence_model():
-    """Initialize and load the confidence detection model"""
-    try:
-        device = torch.device("cpu")  # Use CPU for compatibility
-        
-        # Initialize the same model architecture as in training
-        # Using weights=None instead of pretrained=False (deprecated)
-        model = models.resnet18(weights=None)
-        model.fc = nn.Linear(model.fc.in_features, 2)
-        
-        # Load the trained weights
-        model_path = os.path.join(os.path.dirname(__file__), '..', 'confidence_model.pth')
-        if not os.path.exists(model_path):
-            # Try alternative path
-            model_path = 'confidence_model.pth'
-        
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model file not found at {model_path}")
-        
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        model.eval()
-        
-        print(f"Model loaded successfully from {model_path}")
-        return model
-        
-    except Exception as e:
-        print(f"Error loading model: {str(e)}")
-        raise e
-
-def predict_confidence(image_path, model):
-    """Predict confidence from image using the trained model"""
-    try:
-        print(f"Making prediction for image: {image_path}")
-        
-        # Preprocess the image
-        image_tensor = preprocess_image(image_path)
-        
-        # Make prediction
-        with torch.no_grad():
-            outputs = model(image_tensor)
-            probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
-            predicted_class = torch.argmax(probabilities).item()
-            confidence_score = probabilities[predicted_class].item()
-            
+            return JsonResponse({'error': f'Image processing error: {str(e)}'}, status=400)
+        try:
+            model = get_confidence_model()
+            with torch.no_grad():
+                outputs = model(img_tensor)
+                probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
+                predicted_class = torch.argmax(probabilities).item()
+                confidence_score = probabilities[predicted_class].item()
+                result = "confident" if predicted_class == 0 else "unconfident"
             print(f"Prediction probabilities: {probabilities}")
             print(f"Predicted class: {predicted_class}, confidence: {confidence_score:.4f}")
-            
-            # Map class to label (0: confident, 1: unconfident based on training)
-            result = "confident" if predicted_class == 0 else "unconfident"
             print(f"Final result: {result}")
-            
-            return result
-            
+            return JsonResponse({
+                'result': result,
+                'confidence_score': confidence_score,
+                'message': f'Analysis complete! You appear to be {result}.',
+                'advice': get_confidence_advice(result)
+            })
+        except Exception as e:
+            print(f"Error during model processing: {str(e)}")
+            return JsonResponse({'error': f'Model processing error: {str(e)}'}, status=500)
     except Exception as e:
-        print(f"Error in predict_confidence: {str(e)}")
-        raise e
+        print(f"Error in confidence_checker: {str(e)}")
+        return JsonResponse({'error': f'Processing error: {str(e)}'}, status=500)
 
 def get_confidence_advice(confidence_result):
     """Get advice based on confidence result"""
@@ -533,34 +496,6 @@ def get_confidence_advice(confidence_result):
             "Practice deep breathing to reduce anxiety before interviews.",
             "Record yourself practicing interview questions to improve."
         ]
-
-def preprocess_image(image_path):
-    """Preprocess image for the confidence model"""
-    try:
-        print(f"Preprocessing image: {image_path}")
-        
-        # Load and preprocess the image
-        image = Image.open(image_path)
-        
-        # Convert to RGB if needed (handles RGBA, grayscale, etc.)
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-            print(f"Converted image from {image.mode} to RGB")
-        
-        # Define the same transforms as in training
-        transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        
-        image_tensor = transform(image).unsqueeze(0)  # Add batch dimension
-        print(f"Image preprocessed successfully, tensor shape: {image_tensor.shape}")
-        return image_tensor
-        
-    except Exception as e:
-        print(f"Error preprocessing image: {str(e)}")
-        raise e
 
 # ===================== QUIZ SYSTEM VIEWS =====================
 
